@@ -22,15 +22,19 @@ jobs:
           fetch-depth: 1   # full history gerekmez, hızlı tutar
 
       # ── 2. .NET SDK'lar ───────────────────────────────────────────────────────
-      # ReleaseWinMac hem eski .NET Framework hem de .NET 8 projeleri içeriyor.
-      # windows-latest runner'da VS 2022 Enterprise hazır geliyor;
-      # eksik olan .NET Core 2.1 ve .NET 8 SDK'larını manuel kuruyoruz.
       - name: Setup .NET SDKs
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: |
             2.1.x
             8.0.x
+
+      # ── 3. .NET Framework 4.6.1 Targeting Pack ───────────────────────────────
+      # windows-latest runner'da 4.6.2+ var ama 4.6.1 yok.
+      # DWSIM.Interfaces, DWSIM.Serializers.XML vb. projeler 4.6.1 hedefliyor.
+      - name: Install .NET Framework 4.6.1 Targeting Pack
+        run: choco install netfx-4.6.1-devpack --no-progress -y
+        shell: cmd
 
       # ── 3. MSBUILD ───────────────────────────────────────────────────────────
       - name: Setup MSBuild
@@ -54,20 +58,33 @@ jobs:
       - name: Restore NuGet packages
         run: nuget restore DWSIM.sln -NonInteractive -Verbosity quiet
 
-      # ── 6. BUILD ─────────────────────────────────────────────────────────────
-      # ReleaseWinMac: hem Windows hem macOS için ortak .NET assembly'leri üretir.
-      # /m → parallel build (runner'daki tüm core'ları kullan)
-      # /clp → hata mesajlarını temiz göster
-      - name: Build ReleaseWinMac / x64
+      # ── 6. DistPackages KLASÖRÜNÜ HAZIRLA ────────────────────────────────────
+      # Post-build event script'leri (NaturalGas plugin vb.) build sırasında
+      # DistPackages\Windows, macOS, Linux altındaki plugins/ ve x64/ klasörlerini
+      # silmeye çalışıyor. Klasörler yoksa rd/erase exit code 1 veriyor ve
+      # MSB3073 hatasıyla build kesiliyordu. Önceden oluşturarak bunu engelliyoruz.
+      - name: Pre-create DistPackages directories
+        shell: cmd
         run: |
-          msbuild DWSIM.sln `
-            /p:Configuration=ReleaseWinMac `
-            /p:Platform=x64 `
-            /m `
-            /clp:ErrorsOnly;Summary `
+          for %%d in (Windows Windows_32 macOS Linux) do (
+            for %%s in (plugins x64 x86) do (
+              md "DistPackages\%%d\%%s" 2>nul
+            )
+          )
+
+      # ── 7. BUILD ─────────────────────────────────────────────────────────────
+      # /clp parametresindeki noktalı virgül PowerShell'de yeni komut başlangıcı
+      # sayılıyor. cmd ile çalıştırarak bu sorunu aşıyoruz.
+      - name: Build ReleaseWinMac / x64
+        shell: cmd
+        run: |
+          msbuild DWSIM.sln ^
+            /p:Configuration=ReleaseWinMac ^
+            /p:Platform=x64 ^
+            /m ^
+            /clp:ErrorsOnly;Summary ^
             /flp:LogFile=build.log;Verbosity=minimal
         env:
-          # VS'nin .NET Framework targeting pack'lerini bulabilmesi için
           MSBUILDDISABLENODEREUSE: 1
 
       # ── 7. BUILD LOGU KAYDET (build fail olsa bile görülsün) ─────────────────
@@ -150,5 +167,6 @@ jobs:
           echo "| **Boyut** | ~${size} MB |" >> $env:GITHUB_STEP_SUMMARY
           echo "" >> $env:GITHUB_STEP_SUMMARY
           echo "Artifact: **DWSIM-macOS-x64-${{ github.sha }}**" >> $env:GITHUB_STEP_SUMMARY
+
 
           
