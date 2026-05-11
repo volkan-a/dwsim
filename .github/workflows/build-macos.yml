@@ -1,0 +1,154 @@
+name: Build DWSIM for macOS
+
+# Manuel tetikleme + main branch push'larında otomatik
+on:
+  workflow_dispatch:
+  push:
+    branches: [windows]
+    paths-ignore:
+      - '**.md'
+      - '.github/ISSUE_TEMPLATE/**'
+
+jobs:
+  build:
+    name: Build (Windows → macOS artifact)
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. CHECKOUT ──────────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1   # full history gerekmez, hızlı tutar
+
+      # ── 2. .NET SDK'lar ───────────────────────────────────────────────────────
+      # ReleaseWinMac hem eski .NET Framework hem de .NET 8 projeleri içeriyor.
+      # windows-latest runner'da VS 2022 Enterprise hazır geliyor;
+      # eksik olan .NET Core 2.1 ve .NET 8 SDK'larını manuel kuruyoruz.
+      - name: Setup .NET SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            2.1.x
+            8.0.x
+
+      # ── 3. MSBUILD ───────────────────────────────────────────────────────────
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      # ── 4. NUGET CACHE ───────────────────────────────────────────────────────
+      # Paketleri her build'de tekrar çekmemek için cache'liyoruz (~2-3 dk kazanır)
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nuget/packages
+            ${{ github.workspace }}/.nuget/packages
+          key: nuget-${{ hashFiles('**/*.csproj', '**/*.vbproj', '**/packages.config') }}
+          restore-keys: |
+            nuget-
+
+      # ── 5. NUGET RESTORE ─────────────────────────────────────────────────────
+      - name: Restore NuGet packages
+        run: nuget restore DWSIM.sln -NonInteractive -Verbosity quiet
+
+      # ── 6. BUILD ─────────────────────────────────────────────────────────────
+      # ReleaseWinMac: hem Windows hem macOS için ortak .NET assembly'leri üretir.
+      # /m → parallel build (runner'daki tüm core'ları kullan)
+      # /clp → hata mesajlarını temiz göster
+      - name: Build ReleaseWinMac / x64
+        run: |
+          msbuild DWSIM.sln `
+            /p:Configuration=ReleaseWinMac `
+            /p:Platform=x64 `
+            /m `
+            /clp:ErrorsOnly;Summary `
+            /flp:LogFile=build.log;Verbosity=minimal
+        env:
+          # VS'nin .NET Framework targeting pack'lerini bulabilmesi için
+          MSBUILDDISABLENODEREUSE: 1
+
+      # ── 7. BUILD LOGU KAYDET (build fail olsa bile görülsün) ─────────────────
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failure
+          path: build.log
+          retention-days: 7
+
+      # ── 8. MAC ARTIFACT HAZIRLA ──────────────────────────────────────────────
+      # Derlenen assembly'leri + macOS native lib'lerini tek klasörde topla.
+      # Bu klasör yapısı ileride .app bundle'a dönüştürülecek temel.
+      - name: Assemble macOS output
+        shell: pwsh
+        run: |
+          $outDir = "mac-dist"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          # Derleme çıktısı (cross-platform UI executable + DLL'ler)
+          $buildOut = "DWSIM.UI.Desktop\bin\x64\ReleaseWinMac"
+          if (Test-Path $buildOut) {
+            Write-Host "Copying build output from $buildOut"
+            Copy-Item "$buildOut\*" $outDir -Recurse -Force
+          } else {
+            Write-Warning "Build output not found at $buildOut, trying alternate paths..."
+            # Bazı versiyonlarda çıktı yeri farklı olabilir
+            Get-ChildItem -Path "." -Filter "DWSIM.UI.Desktop" -Recurse -Directory |
+              ForEach-Object {
+                $alt = Join-Path $_.FullName "bin\x64\ReleaseWinMac"
+                if (Test-Path $alt) {
+                  Write-Host "Found at: $alt"
+                  Copy-Item "$alt\*" $outDir -Recurse -Force
+                }
+              }
+          }
+
+          # macOS'a özgü native dylib'ler ve launcher
+          if (Test-Path "PlatformFiles\mac") {
+            Write-Host "Copying PlatformFiles\mac"
+            Copy-Item "PlatformFiles\mac\*" $outDir -Recurse -Force
+          }
+
+          # Her iki platformda ortak dosyalar (veri tabanları, config vs.)
+          if (Test-Path "PlatformFiles\Common") {
+            Write-Host "Copying PlatformFiles\Common"
+            Copy-Item "PlatformFiles\Common\*" $outDir -Recurse -Force
+          }
+
+          # İçerik özeti
+          Write-Host "`n── mac-dist içeriği ──"
+          Get-ChildItem $outDir | Format-Table Name, Length, LastWriteTime
+
+      # ── 9. ARTIFACT UPLOAD ───────────────────────────────────────────────────
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DWSIM-macOS-x64-${{ github.sha }}
+          path: mac-dist/
+          retention-days: 30
+          if-no-files-found: error   # boş artifact'ı sessizce geçmesin
+
+      # ── 10. ÖZET ─────────────────────────────────────────────────────────────
+      - name: Job summary
+        if: success()
+        shell: pwsh
+        run: |
+          $files = (Get-ChildItem mac-dist -Recurse -File).Count
+          $size  = [math]::Round(
+            (Get-ChildItem mac-dist -Recurse -File |
+              Measure-Object Length -Sum).Sum / 1MB, 1)
+          echo "## ✅ Build Başarılı" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "| | |" >> $env:GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Config** | ReleaseWinMac / x64 |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Dosya sayısı** | $files |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Boyut** | ~${size} MB |" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "Artifact: **DWSIM-macOS-x64-${{ github.sha }}**" >> $env:GITHUB_STEP_SUMMARY
+
+          
